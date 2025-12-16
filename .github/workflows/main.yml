@@ -10,10 +10,11 @@ jobs:
 
     steps:
       - name: Rename Computer and Description
+        shell: powershell
         run: |
           $newName = "universe"
           
-          # Change Computer Name in Registry (takes effect without restart for most purposes)
+          # Change Computer Name in Registry
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName" -Name "ComputerName" -Value $newName -Force
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName" -Name "ComputerName" -Value $newName -Force
           
@@ -21,15 +22,15 @@ jobs:
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "Hostname" -Value $newName -Force
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "NV Hostname" -Value $newName -Force
           
-          # Change Computer Description (removes "Virtual Machine")
+          # Change Computer Description
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "srvcomment" -Value $newName -Force
           
-          # Also set via WMI for good measure
+          # Set via WMI
           $computer = Get-WmiObject Win32_OperatingSystem
           $computer.Description = $newName
           $computer.Put()
           
-          # Change OEM Info (appears in System Properties)
+          # Change OEM Info
           $oemPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation"
           if (-not (Test-Path $oemPath)) {
               New-Item -Path $oemPath -Force | Out-Null
@@ -37,51 +38,29 @@ jobs:
           Set-ItemProperty -Path $oemPath -Name "Manufacturer" -Value $newName -Force
           Set-ItemProperty -Path $oemPath -Name "Model" -Value $newName -Force
           
-          # Rename via .NET (another method)
-          Add-Type -TypeDefinition @"
-          using System;
-          using System.Runtime.InteropServices;
-          public class ComputerRename {
-              [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
-              public static extern bool SetComputerName(string lpComputerName);
-              
-              [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
-              public static extern bool SetComputerNameEx(int NameType, string lpBuffer);
-          }
-"@
-          [ComputerRename]::SetComputerName($newName)
-          [ComputerRename]::SetComputerNameEx(0, $newName)  # NetBIOS name
-          [ComputerRename]::SetComputerNameEx(1, $newName)  # DNS hostname
-          [ComputerRename]::SetComputerNameEx(2, $newName)  # DNS domain
+          # Use Rename-Computer cmdlet
+          Rename-Computer -NewName $newName -Force -ErrorAction SilentlyContinue
           
-          Write-Host "Computer renamed to '$newName'"
-          Write-Host "Description changed to '$newName'"
+          Write-Host "Computer renamed to: $newName"
 
       - name: Configure Core RDP Settings
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
-          Add-Type -AssemblyName System.Security
           $charSet = @{
               Upper   = [char[]](65..90)
               Lower   = [char[]](97..122)
               Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126))
+              Special = [char[]](33..47)
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -90,24 +69,19 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
           New-LocalUser -Name "universe" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "universe"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "universe"
           
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "universe")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
@@ -123,34 +97,34 @@ jobs:
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "Tailscale IP not assigned"
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+              Write-Error "RDP port test failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "RDP is accessible!"
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n==============================="
+          Write-Host ""
+          Write-Host "==============================="
           Write-Host "        RDP ACCESS INFO"
           Write-Host "==============================="
           Write-Host "Computer:  universe"
           Write-Host "Address:   $env:TAILSCALE_IP"
           Write-Host "Username:  universe"
           Write-Host "Password:  $env:RDP_PASSWORD"
-          Write-Host "===============================`n"
+          Write-Host "==============================="
+          Write-Host ""
           
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Write-Host "[$(Get-Date)] RDP Active"
               Start-Sleep -Seconds 300
           }
